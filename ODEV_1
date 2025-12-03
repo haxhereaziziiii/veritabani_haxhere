@@ -1,0 +1,390 @@
+
+CREATE TABLE IF NOT EXISTS persons (
+    person_id SERIAL PRIMARY KEY,
+    first_name   VARCHAR(100) NOT NULL,
+    last_name    VARCHAR(100) NOT NULL,
+    email        VARCHAR(150) UNIQUE,
+    phone        VARCHAR(30),
+    created_at   TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS attendees (
+    ticket_preference VARCHAR(50),
+    ticket_count INT DEFAULT 0
+) INHERITS (persons);
+
+CREATE TABLE IF NOT EXISTS staff (
+    ROLE VARCHAR(100),
+    hire_start_date DATE
+) INHERITS (persons);
+
+CREATE TABLE IF NOT EXISTS jury_members (
+    affiliation VARCHAR(200),
+    expertise_notes TEXT
+) INHERITS (persons);
+---------------------------------------------------------------------------
+---FESTIVAL-----
+
+
+CREATE TABLE IF NOT EXISTS festival_edition (
+  festival_id SERIAL PRIMARY KEY,
+  YEAR INT NOT NULL,
+  NAME VARCHAR(200),
+  start_date DATE,
+  end_date DATE
+);
+
+CREATE TABLE IF NOT EXISTS venues (
+  venue_id SERIAL PRIMARY KEY,
+  NAME VARCHAR(200) NOT NULL,
+  address TEXT,
+  city VARCHAR(100),
+  capacity_total INT
+);
+
+CREATE TABLE IF NOT EXISTS hall (
+  hall_id SERIAL PRIMARY KEY,
+  venue_id INT NOT NULL REFERENCES venues(venue_id) ON DELETE CASCADE,
+  NAME VARCHAR(200),
+  seating_capacity INT,
+  has_assigned_seats BOOLEAN DEFAULT TRUE,
+  UNIQUE (venue_id, NAME)
+);
+
+CREATE TABLE IF NOT EXISTS genres (
+  genre_id SERIAL PRIMARY KEY,
+  NAME VARCHAR(100) NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS submissions (
+  submission_id SERIAL PRIMARY KEY,
+  film_title_submitted VARCHAR(300),
+  submitting_person_id INT REFERENCES persons(person_id),
+  submission_date TIMESTAMP DEFAULT now(),
+  status VARCHAR(50) DEFAULT 'pending'
+);
+
+CREATE TABLE IF NOT EXISTS films (
+  film_id SERIAL PRIMARY KEY,
+  title VARCHAR(300) NOT NULL,
+  duration_min INT,
+  production_year INT,
+  country VARCHAR(100),
+  LANGUAGE VARCHAR(50),
+  submission_id INT REFERENCES submissions(submission_id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS film_genres (
+  film_id INT NOT NULL REFERENCES films(film_id) ON DELETE CASCADE,
+  genre_id INT NOT NULL REFERENCES genres(genre_id) ON DELETE CASCADE,
+  PRIMARY KEY (film_id, genre_id)
+);
+
+CREATE TABLE IF NOT EXISTS screenings (
+  screening_id SERIAL PRIMARY KEY,
+  film_id INT NOT NULL REFERENCES films(film_id) ON DELETE CASCADE,
+  hall_id INT REFERENCES hall(hall_id),
+  festival_id INT REFERENCES festival_edition(festival_id),
+  screening_start TIMESTAMP,
+  screening_end   TIMESTAMP,
+  language_version VARCHAR(50),
+  capacity_limit INT,
+  status VARCHAR(50) DEFAULT 'scheduled'
+);
+
+-- 1) Eğer tickets henüz oluşturulmamışsa, oluştururken:
+CREATE TABLE IF NOT EXISTS tickets (
+  ticket_id SERIAL PRIMARY KEY,
+  screening_id INT NOT NULL REFERENCES screenings(screening_id) ON DELETE CASCADE,
+  attendee_person_id INT REFERENCES attendees(person_id) ON DELETE SET NULL,  -- <-- changed
+  seat_label VARCHAR(30),
+  price NUMERIC(10,2),
+  currency VARCHAR(10) DEFAULT 'TRY',
+  status VARCHAR(30) DEFAULT 'active',
+  purchased_at TIMESTAMP DEFAULT now()
+);
+
+
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_screening_seat ON tickets(screening_id, seat_label);
+
+CREATE TABLE  IF NOT EXISTS payments (
+  payment_id SERIAL PRIMARY KEY,
+  ticket_id INT REFERENCES tickets(ticket_id) ON DELETE CASCADE,
+  amount NUMERIC(12,2) NOT NULL CHECK (amount >= 0),
+  currency VARCHAR(10) DEFAULT 'TRY',
+  payment_method VARCHAR(50),
+  payment_day TIMESTAMP DEFAULT now(),
+  processed_by INT REFERENCES staff(staff_id),
+  payment_status VARCHAR(30) DEFAULT 'paid'
+);
+
+CREATE TABLE  IF NOT EXISTS award_categories (
+  category_id SERIAL PRIMARY KEY,
+  NAME VARCHAR(200) NOT NULL,
+  description TEXT
+);
+
+CREATE TABLE IF NOT EXISTS awards (
+  award_id SERIAL PRIMARY KEY,
+  edition_year INT,
+  NAME VARCHAR(200) NOT NULL,
+  award_type VARCHAR(100),
+  film_id INT REFERENCES films(film_id),
+  category_id INT REFERENCES award_categories(category_id)
+);
+
+
+CREATE TABLE IF NOT EXISTS film_actor (
+  film_id INT NOT NULL REFERENCES films(film_id) ON DELETE CASCADE,
+  actor_person_id INT NOT NULL REFERENCES persons(person_id) ON DELETE CASCADE,
+  role_name VARCHAR(200),
+  PRIMARY KEY (film_id, actor_person_id)
+);
+
+CREATE TABLE IF NOT EXISTS participation (
+  film_id INT NOT NULL REFERENCES films(film_id) ON DELETE CASCADE,
+  festival_id INT NOT NULL REFERENCES festival_edition(festival_id) ON DELETE CASCADE,
+  PRIMARY KEY (film_id, festival_id)
+);
+
+CREATE TABLE IF NOT EXISTS sponsor_tiers (
+  tier_id SERIAL PRIMARY KEY,
+  NAME VARCHAR(100) NOT NULL,
+  benefits_desc TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sponsors (
+  sponsor_id SERIAL PRIMARY KEY,
+  NAME VARCHAR(200) NOT NULL,
+  contract_start DATE,
+  contract_end DATE,
+  festival_id INT REFERENCES festival_edition(festival_id),
+  amount_committed NUMERIC(14,2),
+  tier_id INT REFERENCES sponsor_tiers(tier_id),
+  payment_id INT REFERENCES payments(payment_id)
+);
+
+------------------functions---------------------------
+
+CREATE OR REPLACE FUNCTION auto_create_attendee()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO attendees(person_id, ticket_preference, ticket_count)
+    VALUES (NEW.person_id, 'standard', 0);
+    RETURN NEW;
+END;
+
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION prevent_overlapping_screenings()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM screenings s
+        WHERE s.hall_id = NEW.hall_id
+          AND (
+                NEW.screening_start, NEW.screening_end
+              ) OVERLAPS (
+                s.screening_start, s.screening_end
+              )
+          AND s.screening_id <> NEW.screening_id
+    ) THEN
+        RAISE EXCEPTION 'Screening time overlaps with an existing screening in the same hall!';
+    END IF;
+
+    RETURN NEW;
+END;
+
+$$ LANGUAGE plpgsql;
+
+
+
+CREATE OR REPLACE FUNCTION update_ticket_count()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.attendee_person_id IS NOT NULL THEN
+        UPDATE attendees
+        SET ticket_count = COALESCE(ticket_count,0) + 1
+        WHERE person_id = NEW.attendee_person_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+
+CREATE OR REPLACE FUNCTION auto_participation()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO participation(film_id, festival_id)
+    VALUES (NEW.film_id, NEW.festival_id)
+    ON CONFLICT DO NOTHING;
+
+    RETURN NEW;
+END;
+
+$$ LANGUAGE plpgsql;
+
+-----JUST FUNC----
+CREATE OR REPLACE FUNCTION sp_purchase_ticket(
+    p_screening_id INT,
+    p_person_id INT,       -- buyer (attendee person_id)
+    p_seat_label VARCHAR,
+    p_price NUMERIC,
+    p_currency VARCHAR DEFAULT 'TRY',
+    p_payment_method VARCHAR DEFAULT 'card'
+) RETURNS INT LANGUAGE plpgsql AS $$
+DECLARE
+    v_ticket_id INT;
+    v_capacity INT;
+    v_sold_count INT;
+BEGIN
+    -- Basit kapasite kontrol
+    SELECT capacity_limit INTO v_capacity FROM screenings WHERE screening_id = p_screening_id;
+    IF v_capacity IS NOT NULL THEN
+        SELECT COUNT(*) INTO v_sold_count FROM tickets WHERE screening_id = p_screening_id;
+        IF v_sold_count >= v_capacity THEN
+            RAISE EXCEPTION 'Screening is full';
+        END IF;
+    END IF;
+
+    -- Koltuk boş mu?
+    IF EXISTS (SELECT 1 FROM tickets WHERE screening_id = p_screening_id AND seat_label = p_seat_label) THEN
+        RAISE EXCEPTION 'Seat % already taken for this screening', p_seat_label;
+    END IF;
+
+    -- Insert ticket
+    INSERT INTO tickets(screening_id, attendee_person_id, seat_label, price, currency, status, purchased_at)
+    VALUES (p_screening_id, p_person_id, p_seat_label, p_price, p_currency, 'active', now())
+    RETURNING ticket_id INTO v_ticket_id;
+
+    -- Insert payment
+    INSERT INTO payments(ticket_id, amount, currency, payment_method, payment_day, payment_status)
+    VALUES (v_ticket_id, p_price, p_currency, p_payment_method, now(), 'paid');
+
+    RETURN v_ticket_id;
+END;
+$$;
+
+
+
+--2--
+CREATE OR REPLACE FUNCTION sp_refund_ticket(
+    p_ticket_id INT,
+    p_reason TEXT DEFAULT NULL
+) RETURNS BOOLEAN LANGUAGE plpgsql AS $$
+DECLARE
+    v_payment_id INT;
+BEGIN
+    -- check ticket exists
+    IF NOT EXISTS (SELECT 1 FROM tickets WHERE ticket_id = p_ticket_id) THEN
+        RAISE EXCEPTION 'Ticket % not found', p_ticket_id;
+    END IF;
+
+    -- mark ticket as refunded/cancelled
+    UPDATE tickets
+    SET status = 'cancelled'
+    WHERE ticket_id = p_ticket_id;
+
+    -- mark payment as refunded (simple example: update last payment for ticket)
+    SELECT payment_id INTO v_payment_id FROM payments WHERE ticket_id = p_ticket_id ORDER BY payment_day DESC LIMIT 1;
+    IF v_payment_id IS NOT NULL THEN
+        UPDATE payments
+        SET payment_status = 'refunded'
+        WHERE payment_id = v_payment_id;
+    END IF;
+
+    -- Optionally log refund in a table (you can create refund_log if needed)
+    RETURN TRUE;
+END;
+$$;
+
+
+CREATE OR REPLACE FUNCTION sp_add_submission_and_film(
+    p_submitting_person_id INT,
+    p_film_title VARCHAR,
+    p_production_year INT,
+    p_country VARCHAR,
+    p_language VARCHAR
+) 
+RETURNS INT 
+LANGUAGE plpgsql 
+AS $$
+DECLARE
+    v_submission_id INT;
+    v_film_id INT;
+BEGIN
+    -- Insert submission record
+    INSERT INTO submissions 
+        (film_title_submitted, submitting_person_id, submission_date, status)
+    VALUES 
+        (p_film_title, p_submitting_person_id, now(), 'pending')
+    RETURNING submission_id INTO v_submission_id;
+
+    -- Insert film record
+    INSERT INTO films 
+        (title, production_year, country, language, submission_id)
+    VALUES 
+        (p_film_title, p_production_year, p_country, p_language, v_submission_id)
+    RETURNING film_id INTO v_film_id;
+
+    RETURN v_film_id;
+END;
+$$;
+
+
+---4---
+CREATE OR REPLACE FUNCTION sp_get_available_seats(p_screening_id INT)
+RETURNS TABLE(seat_label VARCHAR) LANGUAGE SQL AS $$
+    SELECT s.label
+    FROM (
+      -- burada varsayılan olarak salon koltukları tablosu yoksa, seating modelinize göre uyarlayın.
+      -- Örnek amaçlı, eğer hall bazlı sabit koltuk stringleri yoksa bu sorgu sadece doluları döndürmez.
+      -- Eğer salon koltuk veritabanında yoksa, bu fonksiyon kapasite-limit kullanarak boş yer sayısı verebilir.
+      SELECT NULL::VARCHAR AS label WHERE FALSE
+    ) s
+    WHERE TRUE;
+$$;
+
+
+---------------------triggers------------------
+
+DROP TRIGGER IF EXISTS trg_auto_create_attendee ON persons;
+DROP TRIGGER IF EXISTS trg_no_overlap_screenings ON screenings;
+DROP TRIGGER IF EXISTS trg_increment_ticket_count ON tickets;
+DROP TRIGGER IF EXISTS trg_auto_participation ON screenings;
+
+
+CREATE TRIGGER trg_auto_create_attendee
+AFTER INSERT ON persons
+FOR EACH ROW
+EXECUTE FUNCTION auto_create_attendee();
+----------------
+
+CREATE TRIGGER trg_no_overlap_screenings
+BEFORE INSERT OR UPDATE ON screenings
+FOR EACH ROW
+EXECUTE FUNCTION prevent_overlapping_screenings();
+----------------
+
+DROP TRIGGER IF EXISTS trg_increment_ticket_count ON tickets;
+CREATE TRIGGER trg_increment_ticket_count
+AFTER INSERT ON tickets
+FOR EACH ROW
+EXECUTE FUNCTION update_ticket_count();
+
+
+-----------------
+CREATE TRIGGER trg_auto_participation
+AFTER INSERT ON screenings
+FOR EACH ROW
+EXECUTE FUNCTION auto_participation();
+
+
+
+
+
